@@ -1,9 +1,15 @@
 'use strict';
 
+
 const Promise = require('bluebird');
+const EventEmitter = require('eventemitter2');
 const rp = require('request-promise');
+const debug = require('debug')('SignalR');
 const URL = require('url');
 const WS = require('ws');
+
+const { HubError, ServerError } = require('./errors');
+const { to64 } = require('./helpers');
 
 
 const CLIENT_PROTOCOL_VERSION = '1.5';
@@ -25,12 +31,17 @@ function prepareHubs(hubs) {
   });
 }
 
+
+var COUNTER = 0;
+
 // TODO: negotiate
 // TODO: start
 // TODO: connect
 
-class Signalr {
+class Signalr extends EventEmitter {
   constructor(opts = {}) {
+    super({wildcard:true});
+
     this.baseURL = opts.baseURL;
     this._transport = null;
     this.state = null;
@@ -41,6 +52,7 @@ class Signalr {
     this.groupsToken = null;
     this.id = null;
     this.messageId = null;
+    this._lastInvokeId = 0;
     this._ = {
       keepAliveData: {},
       lastMessageAt: new Date().getTime(),
@@ -98,6 +110,7 @@ class Signalr {
     if(this.hubs) {
       url.searchParams.set('connectionData', JSON.stringify(prepareHubs(this.hubs)));
     }
+
 
     return url;
   }
@@ -214,7 +227,7 @@ class Signalr {
 
 
         if(!res.ProtocolVersion || res.ProtocolVersion !== this.clientProtocol) {
-          throw new Error(`You are using a version of the client that isn't compatible with the server. Client version ${d.clientProtocol}, server version ${res.ProtocolVersion}.`);
+          throw new Error(`You are using a version of the client that isn't compatible with the server. Client version ${this.clientProtocol}, server version ${res.ProtocolVersion}.`);
           return;
         }
 
@@ -261,43 +274,55 @@ class Signalr {
         console.log('ws.err', err);
       })
       .on('message', (data) => {
-        console.log('ws.message', data);
+        let messages = [];
 
         data = Signalr._parseResponse(data);
 
-        // data.M is PersistentResponse.Messages
-        if(Object.keys(data).length === 0 || data.M) {
-          data = Signalr.decodePersistentMessage(data);
 
+        // Hearbeat
+        if(Object.keys(data).length === 0) {
+          debug('heartbeat');
+          this.emit('heartbeat');
+        }
+        // Persistent message
+        else if(data.C) {
+          // TODO: mark last message only for persistance messages?
+          // Mark time of last message
           this.markLastMessage();
 
-          this.updateGroups(data.groupsToken);
+          data = Signalr.decodePersistentMessage(data);
 
-          if(data.id) {
-            this.messageId = data.id;
-          }
+          this.updateGroupsToken(data.groupsToken);
 
-          if(Array.isArray(data.messages)) {
-            data.messages.forEach(message => {
-              this.triggerMessage(message);
-            });
-          }
+          this.messageId = data.id;
 
-          if(data.initMessage) {
+          if(data.init) {
             console.log('TODO! it\'s init message');
           }
-        } else {
-          this.triggerMessage(data);
+
+          messages = data.messages;
+          // console.log('pers', data);
         }
+        // Another (result of request etc)
+        else {
+          messages = [Signalr.decodeMessage(data)];
+        }
+
+        messages.forEach(message => {
+          this.triggerMessage(message);
+        });
 
       })
       .on('ping', (data) => {
+        // TODO:
         console.log('ws.ping', data);
       })
       .on('pong', (data) => {
+        // TODO:
         console.log('ws.pong', data);
       })
       .on('upgrade', (res) => {
+        // TODO:
         console.log('ws.upgrade', 'res');
       })
     ;
@@ -307,7 +332,42 @@ class Signalr {
   }
 
   triggerMessage(message) {
-    console.log('trig mess', message);
+    console.log(message);
+
+    // TODO:
+    if(message.state) {
+      console.log('new state', message.state);
+    }
+
+    // Invoke
+    if(message.invoke) {
+      let invoke = message.invoke;
+
+      debug('Client invoking `%s.%s` with args %o;', invoke.hub, invoke.method, invoke.args);
+
+      this.emit(`invoke.${invoke.hub}.${invoke.method}`, invoke.args);
+    }
+    // Result of request
+    else if(message.result) {
+      let result = message.result;
+
+      debug('Result for request ID = %s. Error = %o. Result = %o', result.id, (result.error ? result.error.message : null), result.result);
+
+      this.emit(`result.${result.id}`, result.error, result.result);
+    }
+    // Progress of request
+    else if(message.progress) {
+      let progress = message.progress;
+
+      debug('Progress for request ID = %s. Data = %o', progress.id, progress.data);
+
+      this.emit(`progress.${result.id}`, progress.data);
+    }
+    // Progress of request
+    else if(message.undef) {
+      // TODO:
+      console.log('UNDEF MESSAGE', message.undef);
+    }
   }
 
   markLastMessage() {
@@ -363,45 +423,6 @@ class Signalr {
     throw new Error('Not implemented');
   }
 
-  start() {
-    let url = this._wrapURL('/start');
-
-    // TODO:
-    url.searchParams.set('transport', 'webSockets');
-
-    return rp(`${url}`)
-      .catch(err => {
-        if(err.error === START_ABORT_TEXT) {
-          // Stop has been called, no need to trigger the error handler
-          // or stop the connection again with onStartError
-          connection.log("The start request aborted because connection.stop() was called.");
-          throw new Error('The connection was stopped during the start request.');
-        }
-
-        console.error(err);
-        throw new Error('Error during start request. Stopping the connection.');
-      })
-      // TODO: stop connection (The start request failed. Stopping the connection.)
-      .then(res => {
-        let data;
-
-        try {
-          data = Signalr._parseResponse(res)
-        } catch (e) {
-          console.error(`Error parsing start response: '${res}'. Stopping the connection.`);
-          throw e;
-        }
-
-        if(data.Response === 'started') {
-          return;
-        }
-        else {
-          throw new Error(`Invalid start response: '${res}'. Stopping the connection."`);
-        }
-      })
-    ;
-  }
-
   abort() {
     let url = this._wrapURL('/abort');
 
@@ -411,19 +432,53 @@ class Signalr {
     return rp(`${url}`);
   }
 
+  // TODO: check state
   send(message) {
-    if(typeof message === 'string' || typeof message === 'undefined' || message === null) {
+    return Promise.resolve()
+      .then(_ => {
+        if(typeof message !== 'string' && typeof message !== 'undefined' || message !== null) {
+          message = JSON.stringify(message);
+        }
 
-    } else {
-      // TODO: JSON?
-      message = JSON.stringify(message);
-    }
+        return new Promise((resolve, reject) => {
+          this.transport.send(message, (err, res) => {
+            if(err) {
+              return reject(err);
+            }
+            
+            resolve(res);
+          });
+        });
+      })
+    ;
+  }
 
-    try {
-      this.transport.send(message);
-    } catch (err) {
-      console.log('WS.send.err', err);
-    }
+  invoke(hub, method, args = []) {
+    let id = to64(++this._lastInvokeId);
+
+    return Promise.resolve()
+      .then(_ => {
+        debug('Invoking `%s.%s` with args %o; ID = %s', hub, method, args, id);
+
+        return this.send({
+          H: hub,
+          M: method,
+          A: args,
+          I: id
+        });
+      })
+      .then(res => {
+        return new Promise((resolve, reject) => {
+          this.once(`result.${id}`, (err, data) => {
+            if(err) {
+              return reject(err);
+            }
+
+            resolve(data);
+          });
+        });
+      })
+      ;
   }
 
   // TODO:
@@ -431,132 +486,114 @@ class Signalr {
     throw new Error('Only for long polling');
   }
 
-  updateGroups(groupsToken) {
+  updateGroupsToken(groupsToken) {
     if(groupsToken) {
       this.groupsToken = groupsToken;
     }
   }
 
+
   static decodePersistentMessage(message) {
-    return {
-      id            : message.C,
-      initMessage   : typeof message.S !== 'undefined' ? true : false,
-      reconnect     : typeof message.T === 'undefined' ? true : false,
-      messages      : message.M,
-      groupsToken   : message.G,
-      longPollDelay : message.L,
-    };
-  }
-
-  static decodeHubMessage(message) {
-    return {
-      id    : message.I,
-      hub   : message.H,
-      method: message.M,
-      args  : message.A,
-      state : message.S
-    };
-  }
-
-}
-
-function parseMessage(mess = '') {
-  mess = JSON.parse(mess);
-
-  if(Object.keys(mess).length === 0) {
-    return {
-      keepAlive: true
-    };
-  }
-
-  if(mess.C) {
-    return parseSimpleMessage(mess);
-  }
-
-  if(mess.H) {
-    return parseHubMesssage(mess);
-  }
-
-
-}
-
-function parseSimpleMessage(mess = {}) {
-  return {
-    id: mess.C,
-    groupToken: mess.G,
-    messages: mess.M,
-    // TODO: init: typeof mess.S !== 'undefined',
-    init: typeof mess.S !== 'undefined' ? true : false,
-    reconnect: typeof (mess.T) !== 'undefined' ? true : false,
-    longPollDelay: mess.L
-  };
-}
-
-function parseHubMesssage(mess = {}) {
-  return {
-    id: mess.I,
-    hub: mess.H,
-    method: mess.M,
-    args: mess.A,
-    state: mess.S
-  };
-}
-
-function parseResponseMessage(mess = {}) {
-  let isError = typeof mess.E !== 'undefined' ? true : false;
-
-  if(!isError) {
-    return {
-      id: mess.I,
-      result: mess.R
-    };
-  }
-
-  return {
-    id: mess.I,
-    error: {
-      hub: typeof mess.H !== 'undefined' ? mess.H : false,
-      error: mess.E,
-      data: mess.D ? mess.D : null,
-      trace: mess.T,
-      state: mess.S
+    let res = {
+      id      : message.C,
+      messages: message.M.map(this.decodeMessage)
     }
+
+    if(typeof message.S !== 'undefined') {
+      res.init = true;
+    }
+
+    if(typeof message.G !== 'undefined') {
+      res.groupsToken = message.G;
+    }
+
+    if(typeof message.T !== 'undefined') {
+      res.reconnect = true;
+    }
+
+    if(typeof message.L !== 'undefined') {
+      res.longPollDelay = message.L;
+    }
+
+    return res;
   }
-}
 
-function parseServerToClientMessage(mess = {}) {
-  return {
-    id: mess.C,
-    methods: (mess.M || []).map(method => {
-      return {
-        hub: method.H,
-        method: method.M,
-        progress: method.P ? {
-          id: method.P.I,
-          data: method.P.D
-        } : null,
-        args: method.A,
-        state: method.S
+  static decodeMessage(message) {
+    let state    = message.S;
+
+    let result   = null;
+    let progress = null;
+    let invoke   = null;
+    let undef    = null;
+
+    // We got progress
+    // {
+    //   I: "P|1",       <------ ID of request with prefix `P|`
+    //   P: {            <------ Progress message
+    //     I: "1",       <------ ID of request
+    //     D: 1          <------ Progress data of request
+    //   }
+    // }
+    if(typeof message.P !== 'undefined') {
+      progress = {
+        id  : message.P.I.toString(),
+        data: message.P.D
       };
-    })
-  };
-}
+    }
 
-function parseProgressMessage(mess = {}) {
-  return {
-    id: mess.C,
-    methods: (mess.M || []).map(method => {
-      return {
-        hub: method.H,
-        method: method.M,
-        args: method.A,
-        state: method.S
+    // We result of request or error
+    else if(typeof message.I !== 'undefined') {
+      let error = null;
+
+      // Error
+      // {
+      //   I: "0",
+      //   E: "Hub error occurred", <------ Error
+      //   H: true,                 <------ Is hub error
+      //   D: {"ErrorNumber":42}    <------ Extra error data
+      //   T: ?                     <------ Trace of error
+      // }
+      if(typeof message.E !== 'undefined') {
+        // Hub error
+        if(typeof message.H !== 'undefined' && message.H) {
+          error = new HubError(message.E, message.D, message.T);
+        }
+        // Server error
+        else {
+          error = new ServerError(message.E, message.D, message.T);
+        }
+      }
+
+      result = {
+        id    : message.I.toString(),
+        error : error,
+        result: message.R
       };
-    })
-  };
+    }
+
+    // We got client hub call
+    else if(typeof message.H !== 'undefined' && typeof message.M !== 'undefined') {
+      invoke = {
+        hub   : message.H,
+        method: message.M,
+        args  : message.A
+      };
+    }
+    // Something else
+    else {
+      undef = message;
+    }
+
+    return {
+      state,
+      result,
+      progress,
+      invoke,
+      undef
+    };
+  }
+
 }
-
-
 
 let client = new Signalr({
   baseURL: 'https://socket.bittrex.com/signalr',
@@ -576,12 +613,24 @@ client.negotiate()
     console.log('started', res);
 
     setTimeout(function () {
-      client.send({
-        H: 'coreHub',
-        M: 'subscribeToExchangeDeltas',
-        A: ['USDT-BTC']
-      });
-    }, 1000);
+      // client.send({
+      //   H: 'coreHub',
+      //   M: 'subscribeToExchangeDeltas',
+      //   A: ['USDT-BTC'],
+      //   I: 'qwdq'
+      // })
+
+      // client.transport.close();
+      client.invoke('coreHub', 'subscribeToExchangeDeltas', undefined ,['USDT-BTC'])
+      .then(res2 => {
+        console.log('invoke.res', res2);
+      })
+      .catch(err => {
+        // console.log('invoke.err', err.message);
+        console.dir(err, {depth:null});
+      })
+
+    }, 2000);
 
 
     // setTimeout(function () {
